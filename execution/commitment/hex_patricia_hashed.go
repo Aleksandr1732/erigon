@@ -99,6 +99,11 @@ type HexPatriciaHashed struct {
 	metrics       *Metrics
 	depthsToTxNum [129]uint64 // endTxNum of file with branch data for that depth
 	hadToLoadL    map[uint64]skipStat
+
+	// Parallel state loading
+	stateLoaderFactory TrieContextFactory // factory to create contexts for parallel state loads
+	parallelLoaders    int                // number of parallel loaders (0 = disabled)
+	processingCtx      context.Context    // context for current processing (for cancellation)
 }
 
 // Clones current trie state to allow concurrent processing.
@@ -1820,6 +1825,126 @@ func afterMapUpdateKind(afterMap uint16) (kind updateKind, nibblesAfterUpdate in
 	}
 }
 
+// cellLoadRequest represents a cell that needs state loading
+type cellLoadRequest struct {
+	cell       *cell
+	nibble     int
+	isAccount  bool // true for account, false for storage
+	plainKey   []byte
+	loadResult *Update
+	err        error
+}
+
+// loadCellStatesParallel loads Account/Storage state for multiple cells in parallel.
+// Returns the number of accounts and storage items loaded.
+func (hph *HexPatriciaHashed) loadCellStatesParallel(ctx context.Context, row int, depth int16) (accLoaded, storLoaded uint64, err error) {
+	if hph.parallelLoaders <= 0 || hph.stateLoaderFactory == nil {
+		return 0, 0, nil // parallel loading not configured
+	}
+
+	// Collect cells that need loading
+	var requests []*cellLoadRequest
+	for bitset := hph.afterMap[row]; bitset != 0; {
+		bit := bitset & -bitset
+		nibble := bits.TrailingZeros16(bit)
+		cell := &hph.grid[row][nibble]
+		bitset ^= bit
+
+		if cell.stateHashLen > 0 {
+			continue // already has hash, skip
+		}
+
+		if !cell.loaded.account() && cell.accountAddrLen > 0 {
+			plainKey := make([]byte, cell.accountAddrLen)
+			copy(plainKey, cell.accountAddr[:cell.accountAddrLen])
+			requests = append(requests, &cellLoadRequest{
+				cell:      cell,
+				nibble:    nibble,
+				isAccount: true,
+				plainKey:  plainKey,
+			})
+		}
+		if !cell.loaded.storage() && cell.storageAddrLen > 0 {
+			plainKey := make([]byte, cell.storageAddrLen)
+			copy(plainKey, cell.storageAddr[:cell.storageAddrLen])
+			requests = append(requests, &cellLoadRequest{
+				cell:      cell,
+				nibble:    nibble,
+				isAccount: false,
+				plainKey:  plainKey,
+			})
+		}
+	}
+
+	if len(requests) <= 1 {
+		return 0, 0, nil // not enough work to parallelize
+	}
+
+	// Create work channel
+	work := make(chan *cellLoadRequest, len(requests))
+	for _, req := range requests {
+		work <- req
+	}
+	close(work)
+
+	// Process in parallel
+	numWorkers := min(hph.parallelLoaders, len(requests))
+	g, gctx := errgroup.WithContext(ctx)
+
+	for i := 0; i < numWorkers; i++ {
+		g.Go(func() error {
+			trieCtx, cleanup := hph.stateLoaderFactory()
+			if cleanup != nil {
+				defer cleanup()
+			}
+
+			for req := range work {
+				select {
+				case <-gctx.Done():
+					return gctx.Err()
+				default:
+				}
+
+				if req.isAccount {
+					req.loadResult, req.err = trieCtx.Account(req.plainKey)
+				} else {
+					req.loadResult, req.err = trieCtx.Storage(req.plainKey)
+				}
+			}
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return 0, 0, err
+	}
+
+	// Apply results back to cells
+	for _, req := range requests {
+		if req.err != nil {
+			if req.isAccount {
+				return accLoaded, storLoaded, fmt.Errorf("failed to get account: %w", req.err)
+			}
+			return accLoaded, storLoaded, fmt.Errorf("failed to get storage: %w", req.err)
+		}
+
+		cell := req.cell
+		cell.setFromUpdate(req.loadResult)
+
+		if req.isAccount {
+			hph.metrics.AccountLoad(req.plainKey)
+			cell.loaded = cell.loaded.addFlag(cellLoadAccount)
+			accLoaded++
+		} else {
+			hph.metrics.StorageLoad(req.plainKey)
+			cell.loaded = cell.loaded.addFlag(cellLoadStorage)
+			storLoaded++
+		}
+	}
+
+	return accLoaded, storLoaded, nil
+}
+
 // The purpose of fold is to reduce hph.currentKey[:hph.currentKeyLen]. It should be invoked
 // until that current key becomes a prefix of hashedKey that we will process next
 // (in other words until the needFolding function returns 0)
@@ -1937,18 +2062,17 @@ func (hph *HexPatriciaHashed) fold() (err error) {
 			bitmap |= hph.afterMap[row]
 		}
 
-		// Calculate total length of all hashes
-		totalBranchLen := int16(17 - nibblesLeftAfterUpdate) // For every empty cell, one byte
-		for bitset, j := hph.afterMap[row], 0; bitset != 0; j++ {
+		// Phase 1: Memoization - reset stateHashLen for touched cells
+		counters := hph.hadToLoadL[hph.depthsToTxNum[depth]]
+		for bitset := hph.afterMap[row]; bitset != 0; {
 			bit := bitset & -bitset
 			nibble := bits.TrailingZeros16(bit)
 			cell := &hph.grid[row][nibble]
+			bitset ^= bit
 
 			if hph.memoizationOff {
 				cell.stateHashLen = 0
 			}
-			/* memoization of state hashes*/
-			counters := hph.hadToLoadL[hph.depthsToTxNum[depth]]
 			if cell.stateHashLen > 0 && (hph.touchMap[row]&hph.afterMap[row]&uint16(1<<nibble) > 0 || cell.stateHashLen != length.Hash) {
 				// drop state hash if updated or hashLen < 32 (corner case, may even not encode such leaf hashes)
 				if hph.trace {
@@ -1963,6 +2087,29 @@ func (hph *HexPatriciaHashed) fold() (err error) {
 					counters.storReset++
 				}
 			}
+		}
+
+		// Phase 2: Parallel state loading (if configured)
+		if hph.parallelLoaders > 0 && hph.stateLoaderFactory != nil {
+			ctx := hph.processingCtx
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			accLoaded, storLoaded, err := hph.loadCellStatesParallel(ctx, row, depth)
+			if err != nil {
+				return err
+			}
+			counters.accLoaded += accLoaded
+			counters.storLoaded += storLoaded
+		}
+
+		// Phase 3: Load remaining states (not loaded in parallel) and calculate total branch length
+		totalBranchLen := int16(17 - nibblesLeftAfterUpdate) // For every empty cell, one byte
+		for bitset := hph.afterMap[row]; bitset != 0; {
+			bit := bitset & -bitset
+			nibble := bits.TrailingZeros16(bit)
+			cell := &hph.grid[row][nibble]
+			bitset ^= bit
 
 			if cell.stateHashLen == 0 { // load state if needed
 				if !cell.loaded.account() && cell.accountAddrLen > 0 {
@@ -1972,7 +2119,6 @@ func (hph *HexPatriciaHashed) fold() (err error) {
 						return fmt.Errorf("failed to get account: %w", err)
 					}
 					cell.setFromUpdate(upd)
-					// if update is empty, loaded flag was not updated so do it manually
 					cell.loaded = cell.loaded.addFlag(cellLoadAccount)
 					counters.accLoaded++
 				}
@@ -1983,18 +2129,14 @@ func (hph *HexPatriciaHashed) fold() (err error) {
 						return fmt.Errorf("failed to get storage: %w", err)
 					}
 					cell.setFromUpdate(upd)
-					// if update is empty, loaded flag was not updated so do it manually
 					cell.loaded = cell.loaded.addFlag(cellLoadStorage)
 					counters.storLoaded++
 				}
-				// computeCellHash can reset hash as well so have to check if node has been skipped  right after computeCellHash.
 			}
-			hph.hadToLoadL[hph.depthsToTxNum[depth]] = counters
-			/* end of memoization */
 
 			totalBranchLen += hph.computeCellHashLen(cell, depth)
-			bitset ^= bit
 		}
+		hph.hadToLoadL[hph.depthsToTxNum[depth]] = counters
 
 		hph.keccak2.Reset()
 		pt := rlp.GenerateStructLen(hph.hashAuxBuffer[:], int(totalBranchLen))
@@ -2625,6 +2767,16 @@ func (hph *HexPatriciaHashed) ProcessWithWarmup(ctx context.Context, updates *Up
 		return err
 	}
 
+	// Enable parallel state loading during fold (uses the same ctxFactory as warmup)
+	if numWorkers > 0 && ctxFactory != nil {
+		hph.SetParallelStateLoading(numWorkers, ctxFactory)
+		hph.SetProcessingContext(ctx)
+		defer func() {
+			hph.SetParallelStateLoading(0, nil)
+			hph.SetProcessingContext(nil)
+		}()
+	}
+
 	// Use HashSortWithPrefetch - loads all keys, warms up, then processes
 	err = updates.HashSortWithPrefetch(ctx, prefetchFn, func(hashedKey, plainKey []byte, stateUpdate *Update) error {
 		select {
@@ -2786,6 +2938,20 @@ func (hph *HexPatriciaHashed) Reset() {
 
 func (hph *HexPatriciaHashed) ResetContext(ctx PatriciaContext) {
 	hph.ctx = ctx
+}
+
+// SetParallelStateLoading enables parallel loading of Account/Storage state during fold.
+// numLoaders is the number of parallel workers (0 to disable).
+// factory creates new PatriciaContext instances for each worker.
+func (hph *HexPatriciaHashed) SetParallelStateLoading(numLoaders int, factory TrieContextFactory) {
+	hph.parallelLoaders = numLoaders
+	hph.stateLoaderFactory = factory
+}
+
+// SetProcessingContext sets the context for the current processing operation.
+// This is used for cancellation and parallel state loading.
+func (hph *HexPatriciaHashed) SetProcessingContext(ctx context.Context) {
+	hph.processingCtx = ctx
 }
 
 type stateRootFlag int8
